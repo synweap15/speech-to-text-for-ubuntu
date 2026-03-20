@@ -36,6 +36,7 @@ import os
 import sys
 import subprocess
 import pwd
+import time
 
 
 # Setup logging
@@ -48,35 +49,57 @@ logging.basicConfig(
     ]
 )
 
+import select
+
 try:
-    from evdev import InputDevice, categorize, ecodes
+    from evdev import InputDevice, categorize, ecodes, list_devices
 except ImportError:
     print("Error: evdev library not found. Install in your venv with: pip install evdev")
     sys.exit(1)
 
-# Configuration
-# To choose the correct event ID for your device, use the `evtest` tool:
-# Run `sudo evtest` in a terminal.
-# If you used input-remapper-gtk then it can look like this: 
-# /dev/input/event12:     input-remapper keyboard
-DEVICE_PATH = "/dev/input/event12"
 
-# Just a temporary file to store the audio. 
+def discover_devices_by_name(name_patterns):
+    """
+    Discover input devices matching any of the given name patterns.
+    Returns a list of device paths that match.
+    """
+    matching_paths = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+            if dev.name in name_patterns:
+                matching_paths.append(path)
+                logging.info(f"Discovered device: {path} ({dev.name})")
+            dev.close()
+        except Exception as e:
+            logging.debug(f"Could not check device {path}: {e}")
+    return matching_paths
+
+# Configuration
+# Device discovery: find Keychron keyboards dynamically by name
+# This supports both USB and Bluetooth connections without hardcoding paths
+DEVICE_NAME_PATTERNS = [
+    "Keychron Keychron K15 Pro",           # USB main keyboard
+    "Keychron Keychron K15 Pro Keyboard",  # USB secondary
+    "Keychron K15 Pro Keyboard",           # Bluetooth keyboard
+]
+
+# Just a temporary file to store the audio.
 AUDIO_FILE = "/tmp/recorded_audio.wav"
 
-# The user who runs the X server accessing the microphone. 
-USER = "david"
+# The user who runs the X server accessing the microphone.
+USER = "pawel"
 
 # We will get XAUTHORITY variable from a running process (e.g., /usr/bin/ksmserver) owned by USER.
-# Find a process that is always running in single instance and owned by USER and has 
+# Find a process that is always running in single instance and owned by USER and has
 # XAUTHORITY variable defined in its environment (see /proc/{pid}/environ)
-PROCESS_FOR_XAUTH_COPY = "/usr/bin/ksmserver"
+PROCESS_FOR_XAUTH_COPY = "/usr/libexec/gnome-session-binary"
 
-# The script that will process the stored audio and generate text from it. 
-SPEECHTOTEXT_SCRIPT = "/home/david/Cursor/speech-to-text/speech_to_text.py"
+# The script that will process the stored audio and generate text from it.
+SPEECHTOTEXT_SCRIPT = "/home/pawel/PycharmProjects/speech-to-text-for-ubuntu/speech_to_text.py"
 
 # Your python virtual environment
-PYTHON_VENV = "/home/david/venv/bin/python3"
+PYTHON_VENV = "/home/pawel/PycharmProjects/speech-to-text-for-ubuntu/venv/bin/python3"
 
 def setup_environment():
     pw_record = pwd.getpwnam(USER)
@@ -85,7 +108,7 @@ def setup_environment():
         "HOME": f"/home/{USER}",
         "XDG_CACHE_HOME": f"/home/{USER}/.cache",
         "XDG_RUNTIME_DIR": f"/run/user/{pw_record.pw_uid}",
-        "DISPLAY": ":0"
+        "DISPLAY": ":1"
     })
 
     # Get XAUTHORITY from the environment of the running process 
@@ -123,62 +146,163 @@ def main():
     if os.geteuid() != 0:
         logging.error("This script must be run as root")
         sys.exit(1)
-    
+
     # Setup
     env = setup_environment()
-    device = InputDevice(DEVICE_PATH)
     recording_process = None
-    
-    logging.info(f"Listening for KEY_F16 on {DEVICE_PATH}")
-    
+
+    # Discover and open all matching devices dynamically
+    device_paths = discover_devices_by_name(DEVICE_NAME_PATTERNS)
+    if not device_paths:
+        logging.error(f"No devices found matching patterns: {DEVICE_NAME_PATTERNS}")
+        sys.exit(1)
+
+    devices = []
+    for path in device_paths:
+        try:
+            dev = InputDevice(path)
+            devices.append(dev)
+            logging.info(f"Opened device: {path} ({dev.name})")
+        except (FileNotFoundError, PermissionError) as e:
+            logging.warning(f"Could not open {path}: {e}")
+
+    if not devices:
+        logging.error("No input devices could be opened")
+        sys.exit(1)
+
+    # Track modifier states
+    modifiers = {
+        'ctrl': False,
+        'shift': False,
+        'alt': False,
+    }
+
+    # Modifier key codes
+    CTRL_KEYS = {'KEY_LEFTCTRL', 'KEY_RIGHTCTRL'}
+    SHIFT_KEYS = {'KEY_LEFTSHIFT', 'KEY_RIGHTSHIFT'}
+    ALT_KEYS = {'KEY_LEFTALT', 'KEY_RIGHTALT'}
+    # Trigger keys mapped to language codes
+    TRIGGER_KEYS = {
+        'KEY_COMMA': 'en',   # Ctrl+Shift+Alt+, for English
+        'KEY_SLASH': 'pl',   # Ctrl+Shift+Alt+/ for Polish
+    }
+
+    # Track recording state (toggle mode)
+    is_recording = False
+    recording_language = None
+    recording_start_time = None
+    MAX_RECORDING_SECONDS = 180  # 3 minutes
+
+    logging.info(f"Listening for Ctrl+Shift+Alt+,/. (toggle mode) on {len(devices)} device(s)")
+
+    def all_modifiers_held():
+        return modifiers['ctrl'] and modifiers['shift'] and modifiers['alt']
+
     try:
-        for event in device.read_loop():
-            if event.type == ecodes.EV_KEY:
-                key = categorize(event)
-                
-                # Ignore key repeats
-                if key.keystate == 2:
-                    continue
-                
-                if key.keycode == 'KEY_F16':
-                    if key.keystate == key.key_down and recording_process is None:
-                        # Start recording
-                        logging.info("Starting audio recording")
-                        recording_process = subprocess.Popen([
-                            "sudo", "-u", USER, "-E",
-                            "arecord",
-                            "-f", "S16_LE", # nothing to do with KEY_F16
-                            "-r", "16000",
-                            "-c", "1",
-                            AUDIO_FILE
-                        ], env=env)
-                        logging.info(f"Recording started with PID {recording_process.pid}")
-                    
-                    elif key.keystate == key.key_up and recording_process:
-                        # Stop recording and process
-                        logging.info("Stopping audio recording")
-                        recording_process.terminate()
-                        recording_process.wait()
-                        logging.info(f"Recording saved to {AUDIO_FILE}")
-                        
-                        # Process audio
-                        logging.info("Running speech-to-text")
-                        subprocess.run([
-                            "sudo", "-u", USER, "-E",
-                            PYTHON_VENV,
-                            SPEECHTOTEXT_SCRIPT,
-                            AUDIO_FILE
-                        ], env=env, check=True)
-                        logging.info("Speech-to-text completed")
-                        
-                        recording_process = None
-                        
+        # Use select to listen on multiple devices
+        device_map = {dev.fd: dev for dev in devices}
+
+        while True:
+            # Use 1s timeout to check recording duration
+            r, _, _ = select.select(devices, [], [], 1.0)
+
+            # Auto-stop recording after max duration
+            if is_recording and (time.time() - recording_start_time) >= MAX_RECORDING_SECONDS:
+                logging.info(f"Recording reached {MAX_RECORDING_SECONDS}s limit, auto-stopping")
+                recording_process.terminate()
+                recording_process.wait()
+                is_recording = False
+                logging.info(f"Recording saved to {AUDIO_FILE}")
+
+                logging.info(f"Running speech-to-text (language: {recording_language})")
+                subprocess.run([
+                    "sudo", "-u", USER, "-E",
+                    PYTHON_VENV,
+                    SPEECHTOTEXT_SCRIPT,
+                    "--language", recording_language,
+                    AUDIO_FILE
+                ], env=env, check=True)
+                logging.info("Speech-to-text completed")
+                recording_process = None
+                recording_language = None
+
+            for dev in r:
+                for event in dev.read():
+                    if event.type == ecodes.EV_KEY:
+                        key = categorize(event)
+                        keycode = key.keycode
+
+                        # Handle list of keycodes (some keys return a list)
+                        if isinstance(keycode, list):
+                            keycode = keycode[0]
+
+                        # Ignore key repeats
+                        if key.keystate == 2:
+                            continue
+
+                        is_down = key.keystate == key.key_down
+
+                        # Debug: log key presses when modifiers are held
+                        if is_down and (modifiers['ctrl'] or modifiers['shift'] or modifiers['alt']):
+                            logging.debug(f"Key pressed with modifiers: {keycode} (ctrl={modifiers['ctrl']}, shift={modifiers['shift']}, alt={modifiers['alt']})")
+
+                        # Update modifier states
+                        if keycode in CTRL_KEYS:
+                            modifiers['ctrl'] = is_down
+                        elif keycode in SHIFT_KEYS:
+                            modifiers['shift'] = is_down
+                        elif keycode in ALT_KEYS:
+                            modifiers['alt'] = is_down
+
+                        # Check for trigger key with all modifiers (toggle on key DOWN)
+                        if keycode in TRIGGER_KEYS and is_down and all_modifiers_held():
+                            language = TRIGGER_KEYS[keycode]
+
+                            if not is_recording:
+                                # Start recording
+                                recording_language = language
+                                logging.info(f"Starting audio recording (toggle ON, language: {language})")
+                                recording_process = subprocess.Popen([
+                                    "sudo", "-u", USER, "-E",
+                                    "pw-record",
+                                    "--rate", "16000",
+                                    "--channels", "1",
+                                    "--format", "s16",
+                                    AUDIO_FILE
+                                ], env=env)
+                                is_recording = True
+                                recording_start_time = time.time()
+                                logging.info(f"Recording started with PID {recording_process.pid}")
+
+                            else:
+                                # Stop recording and process
+                                logging.info("Stopping audio recording (toggle OFF)")
+                                recording_process.terminate()
+                                recording_process.wait()
+                                is_recording = False
+                                logging.info(f"Recording saved to {AUDIO_FILE}")
+
+                                # Process audio with the language from when recording started
+                                logging.info(f"Running speech-to-text (language: {recording_language})")
+                                subprocess.run([
+                                    "sudo", "-u", USER, "-E",
+                                    PYTHON_VENV,
+                                    SPEECHTOTEXT_SCRIPT,
+                                    "--language", recording_language,
+                                    AUDIO_FILE
+                                ], env=env, check=True)
+                                logging.info("Speech-to-text completed")
+
+                                recording_process = None
+                                recording_language = None
+
     except KeyboardInterrupt:
         logging.info("Shutting down due to keyboard interrupt")
         if recording_process:
             recording_process.terminate()
     except Exception as e:
         logging.error(f"Error: {e}")
+        sys.exit(1)  # Exit with error code so systemd can restart
 
 if __name__ == "__main__":
     main()

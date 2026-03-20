@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Simple speech-to-text processor using Faster Whisper. For speed we use the tiny.en model.
+Simple speech-to-text processor using Faster Whisper.
+
+For English we use the tiny.en model for speed. For other languages we use the
+tiny multilingual model.
 
 The script expects an audio file (e.g. /tmp/recorded_audio.wav) as an argument.
 
-Usage: python3 speech_to_text.py <audio_file>
+Usage: python3 speech_to_text.py [--language LANG] <audio_file>
 
 Tested on Ubuntu 24.04.2 LTS
 
 The script is intended to be run using your Python virtual environment (see key_listener.py).
 """
 
+import argparse
 import logging
 import sys
 import os
 import pwd
+import subprocess
 
 
 # Setup logging
@@ -29,12 +34,11 @@ logging.basicConfig(
 
 try:
     import numpy as np
-    import pyautogui
     import soundfile as sf
     from faster_whisper import WhisperModel
 except ImportError as e:
     print(f"Error: Required library not found: {e}")
-    print("Install in your venv with: pip install numpy pyautogui soundfile faster-whisper")
+    print("Install in your venv with: pip install numpy soundfile faster-whisper")
     sys.exit(1)
 
 def log_user_info():
@@ -69,17 +73,19 @@ def load_audio(file_path):
         logging.error(f"Failed to read audio file {file_path}: {e}")
         sys.exit(1)
 
-def transcribe_audio(audio):
+def transcribe_audio(audio, language="en"):
     """Transcribe audio using Whisper."""
     try:
-        logging.info("Loading Whisper model...")
-        model = WhisperModel("tiny.en", compute_type="int8")
-        
+        # Use English-only model for English (faster), multilingual small for others
+        model_name = "tiny.en" if language == "en" else "small"
+        logging.info(f"Loading Whisper model '{model_name}' for language '{language}'...")
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+
         logging.info("Starting transcription...")
         segments, _ = model.transcribe(
-            audio, 
-            language="en", 
-            beam_size=1, 
+            audio,
+            language=language,
+            beam_size=1,
             vad_filter=True
         )
         
@@ -99,38 +105,39 @@ def transcribe_audio(audio):
         sys.exit(1)
 
 def type_text(text):
-    """Type text using pyautogui."""
+    """Type text using xdotool for better Unicode support."""
     try:
         logging.info(f"Typing: {text}")
-        pyautogui.typewrite(text + ' ')
+        subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--", text + " "],
+            check=True
+        )
     except Exception as e:
         logging.error(f"Failed to type text: {e}")
 
 def main():
     """Main function."""
-    # Check arguments
-    if len(sys.argv) < 2:
-        print("Usage: python speech_to_text.py <audio_file>")
-        sys.exit(1)
-    
-    audio_file = sys.argv[1]
-    
+    parser = argparse.ArgumentParser(description="Speech-to-text using Faster Whisper")
+    parser.add_argument("audio_file", help="Path to audio file")
+    parser.add_argument("--language", default="en", help="Language code (default: en)")
+    args = parser.parse_args()
+
     # Log user info
     log_user_info()
-    
+
     # Process audio
-    logging.info(f"Processing audio file: {audio_file}")
-    
+    logging.info(f"Processing audio file: {args.audio_file} (language: {args.language})")
+
     # Load audio
-    audio = load_audio(audio_file)
-    
+    audio = load_audio(args.audio_file)
+
     # Transcribe
-    segments = transcribe_audio(audio)
-    
+    segments = transcribe_audio(audio, language=args.language)
+
     # Type results
     for segment in segments:
         type_text(segment)
-    
+
     logging.info("Processing completed")
 
 if __name__ == "__main__":

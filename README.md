@@ -1,27 +1,44 @@
 # Speech-to-Text For Ubuntu
 
-A simple Python project to record audio using a hotkey (such as a remapped mouse side button) and automatically and offline transcribe it to text using a speech-to-text Faster Whisper model. Designed for use on Linux systems (tested on Ubuntu 24.04.2 LTS).
+A simple Python project to record audio using keyboard hotkeys and automatically transcribe it to text offline using Faster Whisper. Supports multiple languages with different trigger keys. Designed for use on Linux systems (tested on Ubuntu 24.04.2 LTS).
+
+## Features
+
+- **Multi-language support**: English and Polish with separate hotkeys
+- **Toggle recording**: Press hotkey to start, press again to stop and transcribe
+- **Auto-stop**: Recording automatically stops after 3 minutes
+- **Offline**: Uses local Faster Whisper models, no internet required
+- **Auto-type**: Transcribed text is typed into the active window via xdotool
+
+## Keyboard Shortcuts
+
+| Shortcut | Language | Whisper Model |
+|---|---|---|
+| `Ctrl+Shift+Alt+,` | English | `tiny.en` (fast) |
+| `Ctrl+Shift+Alt+/` | Polish | `small` (multilingual) |
 
 ## Project Overview
 
-- **key_listener.py**: Monitors a designated key (such as F16, which can be mapped to a mouse button or to any other key) to control audio recording. Recording begins when the key is pressed and ends upon release, at which point speech-to-text processing is automatically initiated.
+- **key_listener.py**: Runs as root, monitors keyboard via evdev for hotkey combos. Discovers Keychron K15 Pro keyboards dynamically. Starts/stops `pw-record` for audio capture and triggers transcription.
 
-- **speech_to_text.py**: Loads the recorded audio, processes it (converts stereo to mono if needed), and transcribes the speech to text using the Faster Whisper model.
+- **speech_to_text.py**: Loads recorded audio, transcribes using Faster Whisper, and types the result into the active window using `xdotool`.
+
+- **speech-to-text.service**: systemd unit file to run the key listener on boot.
 
 ## Requirements
 
 - Python 3.x
 - Linux (tested on Ubuntu 24.04.2 LTS)
-- Python virtual environment with required packages installed (see below)
-- `arecord` (for audio recording)
+- PipeWire (`pw-record` for audio recording)
+- `xdotool` (for typing transcribed text)
 - `evdev` (for key listening)
-- A speech-to-text model Faster Whisper
+- Faster Whisper
 
 ## Setup
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/CDNsun/speech-to-text-for-ubuntu
+   git clone https://github.com/synweap15/speech-to-text-for-ubuntu
    cd speech-to-text-for-ubuntu
    ```
 2. **Create and activate a Python virtual environment**
@@ -33,55 +50,36 @@ A simple Python project to record audio using a hotkey (such as a remapped mouse
    ```bash
    pip install -r requirements.txt
    ```
-4. **Ensure you have `arecord` and `evdev` installed**
+4. **Install system dependencies**
    ```bash
-   sudo apt install alsa-utils python3-evdev
+   sudo apt install pipewire xdotool
    ```
-5. **Remap your mouse button to an unused key (e.g., F16) using input-remapper or similar tool.**
+5. **Pre-download Whisper models**
+   ```bash
+   python3 -c "from faster_whisper import WhisperModel; WhisperModel('tiny.en', device='cpu', compute_type='int8'); WhisperModel('small', device='cpu', compute_type='int8')"
+   ```
+6. **Install and enable the systemd service**
+   ```bash
+   sudo cp speech-to-text.service /etc/systemd/system/
+   sudo systemctl enable --now speech-to-text.service
+   ```
+
+## Configuration
+
+Edit `key_listener.py` to adjust:
+
+- `DEVICE_NAME_PATTERNS` - keyboard device names to monitor
+- `USER` - the desktop user
+- `TRIGGER_KEYS` - hotkey-to-language mappings
+- `MAX_RECORDING_SECONDS` - max recording duration (default: 180s)
+- `PROCESS_FOR_XAUTH_COPY` - process to get XAUTHORITY from
+- `DISPLAY` - X display number
 
 ## Usage
 
-### 1. Start the Key Listener
+The service runs automatically on boot. Press a hotkey to start recording, press it again to stop and transcribe. The transcribed text is typed into whatever window is focused.
 
-Run as root (required for input device access and sudo):
-```bash
-sudo python3 key_listener.py
-```
-
-- Press and hold your chosen key (e.g., F16/mouse button) to start recording.
-- Release the key to stop recording and trigger speech-to-text.
-
-For automatic start on boot you use crontab (for root) similar to this:
-```
-* * * * * ps -ef | grep "/home/david/Cursor/speech-to-text/key_listener.py" | grep -v grep > /dev/null || /usr/bin/python3 /home/david/Cursor/speech-to-text/key_listener.py >> /tmp/key_listener.log 2>&1 &
-```
-
-### 2. Speech-to-Text Script
-
-This script is called automatically by `key_listener.py`, but you can also run it manually:
-```bash
-python3 speech_to_text.py /path/to/audio.wav
-```
-
-## How it Works
-
-- **key_listener.py**
-  - Listens for a specific key event using `evdev`.
-  - Starts `arecord` to record audio when the key is pressed.
-  - Stops recording when the key is released.
-  - Calls `speech_to_text.py` to transcribe the recorded audio.
-  
-
-- **speech_to_text.py**
-  - Loads the recorded audio file.
-  - Converts stereo audio to mono if necessary.
-  - Transcribes the audio to text using a speech-to-text Faster Whisper model.
-  - Types the recognized text into the active window using `pyautogui`.
-
-## Notes
-- You may need to adjust device paths and user names in the scripts to match your system.
-- The script assumes you have a Python virtual environment (e.g., `/home/david/venv/bin/python3`) with the necessary packages installed.
-
+Logs are written to `/tmp/key_listener.log` and `/tmp/speech_to_text.log`.
 
 ## License
 
