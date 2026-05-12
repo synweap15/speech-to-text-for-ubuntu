@@ -32,12 +32,13 @@ logging.basicConfig(
 
 try:
     import numpy as np
-    import pyautogui
     import soundfile as sf
     from faster_whisper import WhisperModel
+    from Xlib import X, XK, display
+    from Xlib.ext import xtest
 except ImportError as e:
     print(f"Error: Required library not found: {e}")
-    print("Install in your venv with: pip install numpy pyautogui soundfile faster-whisper")
+    print("Install in your venv with: pip install numpy soundfile faster-whisper python-xlib")
     sys.exit(1)
 
 SOCKET_PATH = "/tmp/speech_to_text.sock"
@@ -79,15 +80,88 @@ def transcribe(audio, language):
             logging.info(f"Recognized: {text}")
     return results
 
+_xdisplay = None
+_keysym_cache = {}
+_keymap_built = False
+
+def _get_display():
+    global _xdisplay
+    if _xdisplay is None:
+        _xdisplay = display.Display()
+    return _xdisplay
+
+def _build_keymap(d):
+    global _keymap_built
+    if _keymap_built:
+        return
+    mapping = d.get_keyboard_mapping(8, 248)
+    for i, syms in enumerate(mapping):
+        for level, ks in enumerate(syms):
+            if ks != 0 and ks not in _keysym_cache:
+                _keysym_cache[ks] = (i + 8, level)
+    _keymap_built = True
+
+def _find_keycode_and_modifier(d, keysym):
+    _build_keymap(d)
+    return _keysym_cache.get(keysym, (0, 0))
+
+_shift_kc = None
+_altgr_kc = None
+
+def _init_modifier_keycodes(d):
+    global _shift_kc, _altgr_kc
+    if _shift_kc is None:
+        _shift_kc = d.keysym_to_keycode(XK.XK_Shift_L)
+        _altgr_kc = d.keysym_to_keycode(0xfe03)
+
+def _type_char(d, char):
+    keysym = XK.string_to_keysym(char)
+    if keysym == 0:
+        keysym = ord(char)
+    keycode = d.keysym_to_keycode(keysym)
+    if keycode != 0:
+        shift = _needs_shift(d, keycode, keysym)
+        if shift:
+            xtest.fake_input(d, X.KeyPress, _shift_kc)
+        xtest.fake_input(d, X.KeyPress, keycode)
+        xtest.fake_input(d, X.KeyRelease, keycode)
+        if shift:
+            xtest.fake_input(d, X.KeyRelease, _shift_kc)
+        d.sync()
+    else:
+        keycode, level = _find_keycode_and_modifier(d, keysym)
+        if keycode != 0:
+            need_altgr = level >= 4
+            need_shift = level in (1, 5)
+            if need_altgr and _altgr_kc:
+                xtest.fake_input(d, X.KeyPress, _altgr_kc)
+            if need_shift:
+                xtest.fake_input(d, X.KeyPress, _shift_kc)
+            xtest.fake_input(d, X.KeyPress, keycode)
+            xtest.fake_input(d, X.KeyRelease, keycode)
+            if need_shift:
+                xtest.fake_input(d, X.KeyRelease, _shift_kc)
+            if need_altgr and _altgr_kc:
+                xtest.fake_input(d, X.KeyRelease, _altgr_kc)
+            d.sync()
+        else:
+            code = format(ord(char), 'x')
+            subprocess.run(["xdotool", "key", f"U{code}"], check=True)
+
 def type_text(text):
     try:
         logging.info(f"Typing: {text}")
-        subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "80", "--", text + " "],
-            check=True
-        )
+        d = _get_display()
+        _init_modifier_keycodes(d)
+        for char in text + " ":
+            _type_char(d, char)
     except Exception as e:
         logging.error(f"Failed to type text: {e}")
+
+def _needs_shift(d, keycode, keysym):
+    keysym_noshift = d.keycode_to_keysym(keycode, 0)
+    keysym_shift = d.keycode_to_keysym(keycode, 1)
+    return keysym != keysym_noshift and keysym == keysym_shift
 
 def handle_request(data):
     parts = data.strip().split(" ", 1)
