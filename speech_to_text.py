@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 """
-Simple speech-to-text processor using Faster Whisper.
+Speech-to-text daemon using Faster Whisper.
 
-For English we use the tiny.en model for speed. For other languages we use the
-tiny multilingual model.
+Runs as a persistent process with models preloaded in memory.
+Listens on a Unix socket for transcription requests from key_listener.py.
 
-The script expects an audio file (e.g. /tmp/recorded_audio.wav) as an argument.
+Request format (one line): <language> <audio_file_path>
+Response: types text into active window via xdotool, then sends "OK\n" or "ERR ...\n"
 
-Usage: python3 speech_to_text.py [--language LANG] <audio_file>
-
-Tested on Ubuntu 24.04.2 LTS
-
-The script is intended to be run using your Python virtual environment (see key_listener.py).
+Usage: python3 speech_to_text.py
 """
 
-import argparse
+import json
 import logging
-import sys
 import os
 import pwd
+import signal
+import socket
 import subprocess
+import sys
+import time
 
-
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s: %(message)s',
@@ -34,112 +32,120 @@ logging.basicConfig(
 
 try:
     import numpy as np
+    import pyautogui
     import soundfile as sf
     from faster_whisper import WhisperModel
 except ImportError as e:
     print(f"Error: Required library not found: {e}")
-    print("Install in your venv with: pip install numpy soundfile faster-whisper")
+    print("Install in your venv with: pip install numpy pyautogui soundfile faster-whisper")
     sys.exit(1)
 
-def log_user_info():
-    """Log current user information."""
-    try:
-        uid = os.geteuid()
-        user = pwd.getpwuid(uid).pw_name
-        logging.info(f"Running as user: {os.getlogin()}")
-        logging.info(f"Effective user: {user} (UID: {uid})")
-    except Exception as e:
-        logging.warning(f"Could not determine user info: {e}")
+SOCKET_PATH = "/tmp/speech_to_text.sock"
+
+models = {}
+
+def load_models():
+    logging.info("Preloading models...")
+    models['en'] = WhisperModel("base.en", device="cpu", compute_type="int8")
+    logging.info("Loaded base.en model")
+    models['other'] = WhisperModel("base", device="cpu", compute_type="int8")
+    logging.info("Loaded base multilingual model")
 
 def load_audio(file_path):
-    """Load and preprocess audio file."""
-    if not os.path.exists(file_path):
-        logging.error(f"Audio file not found: {file_path}")
-        sys.exit(1)
-    
-    try:
-        audio, samplerate = sf.read(file_path)
-        audio = audio.astype('float32')
-        
-        # Convert stereo to mono if necessary
-        if len(audio.shape) > 1 and audio.shape[1] > 1:
-            audio = np.mean(audio, axis=1)
-            logging.info("Converted stereo audio to mono")
-        
-        logging.info(f"Audio loaded: {file_path}, sample rate: {samplerate}")
-        return audio
-        
-    except Exception as e:
-        logging.error(f"Failed to read audio file {file_path}: {e}")
-        sys.exit(1)
+    audio, samplerate = sf.read(file_path)
+    audio = audio.astype('float32')
+    if len(audio.shape) > 1 and audio.shape[1] > 1:
+        audio = np.mean(audio, axis=1)
+    logging.info(f"Audio loaded: {file_path}, sample rate: {samplerate}")
+    return audio
 
-def transcribe_audio(audio, language="en"):
-    """Transcribe audio using Whisper."""
-    try:
-        # Use English-only model for English (faster), multilingual small for others
-        model_name = "tiny.en" if language == "en" else "small"
-        logging.info(f"Loading Whisper model '{model_name}' for language '{language}'...")
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
-
-        logging.info("Starting transcription...")
-        segments, _ = model.transcribe(
-            audio,
-            language=language,
-            beam_size=1,
-            vad_filter=True
-        )
-        
-        # Process segments
-        results = []
-        for seg in segments:
+def transcribe(audio, language):
+    model = models['en'] if language == 'en' else models['other']
+    segments, _ = model.transcribe(
+        audio,
+        language=language,
+        beam_size=1,
+        vad_filter=True,
+        word_timestamps=True
+    )
+    results = []
+    for seg in segments:
+        if seg.words:
+            text = " ".join(w.word.strip() for w in seg.words if w.word.strip())
+        else:
             text = seg.text.strip()
-            if text:
-                results.append(text)
-                logging.info(f"Recognized: {text}")
-        
-        logging.info(f"Transcription completed: {len(results)} segments")
-        return results
-        
-    except Exception as e:
-        logging.error(f"Transcription failed: {e}")
-        sys.exit(1)
+        if text:
+            results.append(text)
+            logging.info(f"Recognized: {text}")
+    return results
 
 def type_text(text):
-    """Type text using xdotool for better Unicode support."""
     try:
         logging.info(f"Typing: {text}")
         subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--", text + " "],
+            ["xdotool", "type", "--clearmodifiers", "--delay", "80", "--", text + " "],
             check=True
         )
     except Exception as e:
         logging.error(f"Failed to type text: {e}")
 
-def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(description="Speech-to-text using Faster Whisper")
-    parser.add_argument("audio_file", help="Path to audio file")
-    parser.add_argument("--language", default="en", help="Language code (default: en)")
-    args = parser.parse_args()
+def handle_request(data):
+    parts = data.strip().split(" ", 1)
+    if len(parts) != 2:
+        return "ERR invalid request format"
 
-    # Log user info
-    log_user_info()
+    language, audio_file = parts
+    logging.info(f"Processing: {audio_file} (language: {language})")
 
-    # Process audio
-    logging.info(f"Processing audio file: {args.audio_file} (language: {args.language})")
+    if not os.path.exists(audio_file):
+        return f"ERR file not found: {audio_file}"
 
-    # Load audio
-    audio = load_audio(args.audio_file)
-
-    # Transcribe
-    segments = transcribe_audio(audio, language=args.language)
-
-    # Type results
-    for segment in segments:
+    audio = load_audio(audio_file)
+    results = transcribe(audio, language)
+    for segment in results:
         type_text(segment)
 
     logging.info("Processing completed")
+    return "OK"
+
+def cleanup(*_):
+    try:
+        os.unlink(SOCKET_PATH)
+    except OSError:
+        pass
+    sys.exit(0)
+
+def main():
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    load_models()
+
+    if os.path.exists(SOCKET_PATH):
+        os.unlink(SOCKET_PATH)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o777)
+    sock.listen(1)
+
+    logging.info(f"Daemon listening on {SOCKET_PATH}")
+
+    while True:
+        conn, _ = sock.accept()
+        try:
+            data = conn.recv(4096).decode('utf-8')
+            if data:
+                result = handle_request(data)
+                conn.sendall((result + "\n").encode('utf-8'))
+        except Exception as e:
+            logging.error(f"Request failed: {e}")
+            try:
+                conn.sendall(f"ERR {e}\n".encode('utf-8'))
+            except Exception:
+                pass
+        finally:
+            conn.close()
 
 if __name__ == "__main__":
     main()
-

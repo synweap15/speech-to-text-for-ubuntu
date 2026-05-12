@@ -33,6 +33,7 @@ with the necessary packages installed including evdev, numpy pyautogui soundfile
 
 import logging
 import os
+import socket
 import sys
 import subprocess
 import pwd
@@ -199,12 +200,33 @@ def main():
         return modifiers['ctrl'] and modifiers['shift'] and modifiers['alt']
 
     try:
-        # Use select to listen on multiple devices
-        device_map = {dev.fd: dev for dev in devices}
-
         while True:
             # Use 1s timeout to check recording duration
-            r, _, _ = select.select(devices, [], [], 1.0)
+            try:
+                r, _, _ = select.select(devices, [], [], 1.0)
+            except OSError as e:
+                logging.warning(f"Device lost ({e}), reconnecting...")
+                for dev in devices:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                time.sleep(2)
+                device_paths = discover_devices_by_name(DEVICE_NAME_PATTERNS)
+                devices = []
+                for path in device_paths:
+                    try:
+                        dev = InputDevice(path)
+                        devices.append(dev)
+                        logging.info(f"Reconnected device: {path} ({dev.name})")
+                    except Exception:
+                        pass
+                if not devices:
+                    logging.warning("No devices found, retrying in 5s...")
+                    time.sleep(5)
+                # Reset modifier states after reconnect
+                modifiers['ctrl'] = modifiers['shift'] = modifiers['alt'] = False
+                continue
 
             # Auto-stop recording after max duration
             if is_recording and (time.time() - recording_start_time) >= MAX_RECORDING_SECONDS:
@@ -214,15 +236,16 @@ def main():
                 is_recording = False
                 logging.info(f"Recording saved to {AUDIO_FILE}")
 
-                logging.info(f"Running speech-to-text (language: {recording_language})")
-                subprocess.run([
-                    "sudo", "-u", USER, "-E",
-                    PYTHON_VENV,
-                    SPEECHTOTEXT_SCRIPT,
-                    "--language", recording_language,
-                    AUDIO_FILE
-                ], env=env, check=True)
-                logging.info("Speech-to-text completed")
+                logging.info(f"Sending to STT daemon (language: {recording_language})")
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.connect("/tmp/speech_to_text.sock")
+                    sock.sendall(f"{recording_language} {AUDIO_FILE}".encode())
+                    resp = sock.recv(4096).decode().strip()
+                    sock.close()
+                    logging.info(f"STT daemon response: {resp}")
+                except Exception as e:
+                    logging.error(f"STT daemon error: {e}")
                 recording_process = None
                 recording_language = None
 
@@ -242,7 +265,6 @@ def main():
 
                         is_down = key.keystate == key.key_down
 
-                        # Debug: log key presses when modifiers are held
                         if is_down and (modifiers['ctrl'] or modifiers['shift'] or modifiers['alt']):
                             logging.debug(f"Key pressed with modifiers: {keycode} (ctrl={modifiers['ctrl']}, shift={modifiers['shift']}, alt={modifiers['alt']})")
 
@@ -282,16 +304,16 @@ def main():
                                 is_recording = False
                                 logging.info(f"Recording saved to {AUDIO_FILE}")
 
-                                # Process audio with the language from when recording started
-                                logging.info(f"Running speech-to-text (language: {recording_language})")
-                                subprocess.run([
-                                    "sudo", "-u", USER, "-E",
-                                    PYTHON_VENV,
-                                    SPEECHTOTEXT_SCRIPT,
-                                    "--language", recording_language,
-                                    AUDIO_FILE
-                                ], env=env, check=True)
-                                logging.info("Speech-to-text completed")
+                                logging.info(f"Sending to STT daemon (language: {recording_language})")
+                                try:
+                                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                                    sock.connect("/tmp/speech_to_text.sock")
+                                    sock.sendall(f"{recording_language} {AUDIO_FILE}".encode())
+                                    resp = sock.recv(4096).decode().strip()
+                                    sock.close()
+                                    logging.info(f"STT daemon response: {resp}")
+                                except Exception as e:
+                                    logging.error(f"STT daemon error: {e}")
 
                                 recording_process = None
                                 recording_language = None

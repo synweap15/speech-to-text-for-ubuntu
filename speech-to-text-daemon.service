@@ -1,0 +1,15 @@
+[Unit]
+Description=Speech to Text Whisper Daemon
+After=graphical.target
+Before=speech-to-text.service
+
+[Service]
+Type=simple
+User=pawel
+Environment=DISPLAY=:1
+ExecStart=/home/pawel/PycharmProjects/speech-to-text-for-ubuntu/run_daemon.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
